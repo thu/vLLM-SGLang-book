@@ -1,0 +1,94 @@
+# 文件: chapter10/k8s/09_prometheus_adapter.yaml
+#
+# 用途: 配置Prometheus Adapter，将vLLM和SGLang的原始Prometheus指标
+#       注册为Kubernetes Custom Metrics API，供HPA引用
+#
+# 指标名称转换规则（重要）:
+#   vLLM v0.8.x 原始指标名使用冒号作为命名空间分隔符（Prometheus惯例），例如：
+#     vllm:num_requests_waiting
+#     vllm:gpu_cache_usage_perc
+#   Prometheus Adapter在注册为Custom Metrics时，必须显式映射名称，
+#   HPA引用的 metric.name 应与 seriesQuery 中 name.as 的值一致。
+#   本配置统一将冒号替换为下划线：
+#     vllm:num_requests_waiting  →  vllm_num_requests_waiting
+#     vllm:gpu_cache_usage_perc  →  vllm_gpu_cache_usage_perc
+#     sglang:num_queue_reqs      →  sglang_num_queue_reqs
+#
+# 安装Prometheus Adapter:
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm install prometheus-adapter prometheus-community/prometheus-adapter \
+#     -n monitoring \
+#     -f 09_prometheus_adapter.yaml
+#
+# 验证注册结果:
+#   kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1" | jq '.resources[].name'
+
+---
+# Prometheus Adapter Helm values配置
+prometheus:
+  url: http://prometheus-server.monitoring
+  port: 9090
+
+rules:
+  default: false   # 关闭默认规则，只启用下方显式定义的规则
+
+  custom:
+    # ── vLLM: 等待队列长度 ────────────────────────────────────────────────
+    # 原始指标: vllm:num_requests_waiting{namespace, pod}
+    # HPA引用名: vllm_num_requests_waiting
+    - seriesQuery: 'vllm:num_requests_waiting{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "vllm:num_requests_waiting"
+        as: "vllm_num_requests_waiting"      # HPA metric.name 使用此值
+      metricsQuery: 'avg_over_time(vllm:num_requests_waiting{<<.LabelMatchers>>}[2m])'
+
+    # ── vLLM: KV cache使用率 ─────────────────────────────────────────────
+    # 原始指标: vllm:gpu_cache_usage_perc{namespace, pod}（值域0-100）
+    # HPA引用名: vllm_gpu_cache_usage_perc
+    - seriesQuery: 'vllm:gpu_cache_usage_perc{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "vllm:gpu_cache_usage_perc"
+        as: "vllm_gpu_cache_usage_perc"
+      metricsQuery: 'avg_over_time(vllm:gpu_cache_usage_perc{<<.LabelMatchers>>}[2m])'
+
+    # ── SGLang: 请求队列积压 ──────────────────────────────────────────────
+    # 原始指标: sglang:num_queue_reqs{namespace, pod}（SGLang v0.5.x暴露）
+    # HPA引用名: sglang_num_queue_reqs
+    - seriesQuery: 'sglang:num_queue_reqs{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "sglang:num_queue_reqs"
+        as: "sglang_num_queue_reqs"
+      metricsQuery: 'avg_over_time(sglang:num_queue_reqs{<<.LabelMatchers>>}[2m])'
+
+    # ── SGLang: token使用率 ───────────────────────────────────────────────
+    # 原始指标: sglang:token_usage{namespace, pod}（值域0-1）
+    # 主要用于负载均衡控制器的PromQL查询，非HPA触发指标
+    - seriesQuery: 'sglang:token_usage{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "sglang:token_usage"
+        as: "sglang_token_usage"
+      metricsQuery: 'avg_over_time(sglang:token_usage{<<.LabelMatchers>>}[2m])'

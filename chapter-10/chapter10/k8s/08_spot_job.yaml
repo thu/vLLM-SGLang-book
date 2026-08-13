@@ -1,0 +1,113 @@
+# 文件: chapter10/k8s/08_spot_job.yaml
+#
+# 用途: 在Spot节点池上运行离线批量推理Job，利用Spot折扣降低成本
+#
+# 可靠性设计:
+#   - restartPolicy: OnFailure  —— Pod因Spot中断退出时自动重启
+#   - backoffLimit: 50          —— 允许较多次重试，应对Spot高中断率
+#   - CHECKPOINT_DIR            —— 检查点存储路径，由spot/termination_handler.py写入
+#     主进程收到SIGTERM后从检查点续跑，避免重复计算已完成的任务
+#
+# 前置条件:
+#   - Spot节点已配置01_node_labels.yaml中的标签和Taint
+#   - batch-checkpoint-pvc PVC已创建（挂载至持久存储如EFS/NFS）
+#
+# 应用方式:
+#   kubectl apply -f 08_spot_job.yaml -n inference-prod
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llm-batch-inference
+  namespace: inference-prod
+  labels:
+    job-type: batch-inference
+    priority: offline
+spec:
+  completions: 1000                      # 总任务数（每个任务对应一条推理请求）
+  parallelism: 10                        # 同时运行的Pod数（受Spot节点可用性限制）
+  backoffLimit: 50                       # Job级别重试上限，超过后Job标记为Failed
+  completionMode: Indexed               # 每个Pod有唯一索引，便于检查点按索引管理进度
+  template:
+    metadata:
+      labels:
+        job-type: batch-inference
+    spec:
+      restartPolicy: OnFailure           # Pod退出（包括Spot中断后的SIGTERM）时自动重启
+
+      priorityClassName: offline-batch   # 最低优先级，可被实时服务抢占
+
+      # 强制调度至Spot批处理节点
+      nodeSelector:
+        workload-type: batch
+        spot: "true"
+
+      tolerations:
+        - key: "workload-type"
+          operator: "Equal"
+          value: "batch"
+          effect: "NoSchedule"
+        - key: "spot"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+
+      containers:
+        # ── 主容器：执行批量推理 ──────────────────────────────────────────
+        - name: batch-inference
+          image: your-registry/batch-inference:latest
+          imagePullPolicy: Always
+          env:
+            - name: CHECKPOINT_DIR
+              value: "/checkpoints"
+            - name: VLLM_ENDPOINT
+              value: "http://vllm-service.inference-prod:8000"
+            # JOB_COMPLETION_INDEX 由 Kubernetes 自动注入（completionMode: Indexed）
+            - name: TASK_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "16Gi"
+              cpu: "4"
+            limits:
+              nvidia.com/gpu: "1"
+              memory: "16Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: checkpoint-storage
+              mountPath: /checkpoints
+
+        # ── Sidecar容器：监听Spot终止通知 ────────────────────────────────
+        # termination_handler.py（chapter10/spot/termination_handler.py）
+        # 轮询AWS IMDS，收到终止通知后写入检查点文件并向主容器发送信号
+        # 注意: sidecar与主容器共享同一Pod网络和进程命名空间（shareProcessNamespace: true）
+        - name: spot-termination-handler
+          image: your-registry/spot-handler:latest
+          imagePullPolicy: Always
+          env:
+            - name: CHECKPOINT_DIR
+              value: "/checkpoints"
+            - name: SIGNAL_TARGET
+              value: "batch-inference"   # 目标容器名称，用于PID查找
+          volumeMounts:
+            - name: checkpoint-storage
+              mountPath: /checkpoints
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+      # 允许sidecar通过/proc查找主容器PID并发送信号
+      shareProcessNamespace: true
+
+      volumes:
+        - name: checkpoint-storage
+          persistentVolumeClaim:
+            claimName: batch-checkpoint-pvc   # 持久存储，跨Pod重启保留检查点

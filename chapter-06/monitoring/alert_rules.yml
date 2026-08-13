@@ -1,0 +1,95 @@
+# ch06/monitoring/alert_rules.yml
+# Prometheus 告警规则
+# vLLM 高并发 API 服务监控告警
+
+groups:
+  - name: llm_service_alerts
+    rules:
+
+      # --- 延迟告警 ---
+
+      - alert: HighP95Latency
+        expr: |
+          histogram_quantile(0.95,
+            rate(gateway_request_duration_seconds_bucket[5m])
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 延迟超过 500ms，持续 2 分钟"
+          description: "当前 P95: {{ $value | humanizeDuration }}，目标 ≤ 500ms"
+
+      - alert: HighP99Latency
+        expr: |
+          histogram_quantile(0.99,
+            rate(gateway_request_duration_seconds_bucket[5m])
+          ) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P99 延迟超过 1000ms，持续 2 分钟"
+          description: "当前 P99: {{ $value | humanizeDuration }}"
+
+      # --- KV Cache 告警 ---
+
+      - alert: HighKVCacheUsage
+        # 95% 是预警阈值，而非 100%，目的是在触发 preemption 前留出响应时间
+        expr: vllm:gpu_cache_usage_perc > 0.95
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KV Cache 使用率超过 95%"
+          description: "可能即将触发序列 preemption，建议检查并发量是否过高"
+
+      # --- 请求错误率 ---
+
+      - alert: HighErrorRate
+        expr: |
+          rate(gateway_requests_total{status_code=~"5.."}[5m])
+          / rate(gateway_requests_total[5m]) > 0.01
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "请求错误率超过 1%"
+          description: "当前错误率: {{ $value | humanizePercentage }}"
+
+      - alert: HighTimeoutRate
+        expr: |
+          rate(gateway_requests_total{status_code="timeout"}[5m])
+          / rate(gateway_requests_total[5m]) > 0.005
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "推理超时率超过 0.5%"
+
+      # --- 等待队列 ---
+
+      - alert: LargeWaitingQueue
+        # 等待队列持续过长说明系统已超过吞吐上限
+        expr: vllm:num_requests_waiting > 50
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM 等待队列超过 50 个请求"
+          description: "当前等待: {{ $value }} 个请求，系统可能已达吞吐上限"
+
+      # --- GPU 利用率过低（反向告警：可能存在瓶颈转移）---
+
+      - alert: LowGPUUtilization
+        # 在高并发压力下 GPU 利用率低于 50%，
+        # 通常意味着瓶颈在网关或连接层，而非推理层
+        expr: |
+          avg(DCGM_FI_DEV_GPU_UTIL) < 50
+          and rate(gateway_requests_total[1m]) > 100
+        for: 3m
+        labels:
+          severity: info
+        annotations:
+          summary: "高负载下 GPU 利用率低于 50%"
+          description: "当前均值: {{ $value }}%，请检查网关连接池配置"

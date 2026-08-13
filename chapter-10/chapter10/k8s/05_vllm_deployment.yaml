@@ -1,0 +1,192 @@
+# 文件: chapter10/k8s/05_vllm_deployment.yaml
+#
+# 用途: vLLM推理服务的Deployment、HPA自动扩缩容配置
+#
+# HPA指标说明:
+#   vLLM v0.8.x 通过 /metrics 端点暴露 Prometheus 格式指标，原始指标名使用冒号作为命名空间分隔符：
+#     vllm:num_requests_waiting   —— 等待队列中的请求数
+#     vllm:gpu_cache_usage_perc   —— KV cache GPU内存使用率（0-100）
+#
+#   Prometheus Adapter 将原始指标注册为 Kubernetes Custom Metrics 时，
+#   会将冒号（:）转换为下划线（_），因此 HPA 的 metric.name 字段应使用：
+#     vllm_num_requests_waiting
+#     vllm_gpu_cache_usage_perc
+#
+#   Prometheus Adapter 的配置见 09_prometheus_adapter.yaml。
+#
+# 应用方式:
+#   kubectl apply -f 05_vllm_deployment.yaml -n inference-prod
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-server
+  namespace: inference-prod
+  labels:
+    app: vllm-server
+    version: v0.8.0
+    framework: vllm
+spec:
+  replicas: 2                            # 初始副本数，由HPA在[2, 8]范围内动态调整
+  selector:
+    matchLabels:
+      app: vllm-server
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                        # 滚动更新时最多超出期望副本数1个
+      maxUnavailable: 0                  # 滚动更新时不允许服务中断（对SLA敏感服务）
+  template:
+    metadata:
+      labels:
+        app: vllm-server
+        framework: vllm
+      annotations:
+        # 声明Prometheus抓取信息，供Prometheus Server发现
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      priorityClassName: realtime-inference    # 最高优先级，资源不足时优先保障
+
+      # 跨可用区均匀分布，避免单AZ故障导致服务完全中断
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: vllm-server
+
+      nodeSelector:
+        workload-type: vllm              # 调度至vLLM专用节点（对应01_node_labels.yaml）
+
+      tolerations:
+        - key: "workload-type"
+          operator: "Equal"
+          value: "vllm"
+          effect: "NoSchedule"           # 容忍vLLM节点的Taint
+
+      containers:
+        - name: vllm-server
+          image: vllm/vllm-openai:v0.8.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -m
+            - vllm.entrypoints.openai.api_server
+          args:
+            - --model=/models/Qwen2.5-7B-Instruct
+            - --served-model-name=qwen2.5-7b
+            - --tensor-parallel-size=1
+            - --max-model-len=8192          # 最大序列长度（prefill + decode）
+            - --max-num-batched-tokens=32768 # 单批次最大token数，影响吞吐/延迟权衡
+            - --max-num-seqs=256            # 最大并发序列数
+            - --gpu-memory-utilization=0.90 # KV cache最多使用90%显存，余10%供模型权重+激活值
+            - --enable-chunked-prefill      # 分块预填充：长请求分片执行，降低对短请求的TTFT影响
+            - --disable-log-requests        # 生产环境关闭每请求日志，降低IO开销
+            - --port=8000
+            - --host=0.0.0.0
+
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "32Gi"
+              cpu: "8"
+            limits:
+              nvidia.com/gpu: "1"          # GPU不支持超量分配，requests与limits必须相同
+              memory: "32Gi"
+              cpu: "8"
+
+          # 就绪探针：vLLM模型加载（含权重读取+CUDA预热）通常需要60-120秒
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+
+          # 存活探针：使用更长的初始等待和更宽松的失败阈值，避免模型加载期间误触发重启
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 180
+            periodSeconds: 30
+            failureThreshold: 5
+
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+              readOnly: true
+            - name: shared-memory
+              mountPath: /dev/shm          # vLLM通过共享内存在进程间传递张量
+
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: model-storage-pvc  # 预先创建的PVC，挂载模型文件存储
+        - name: shared-memory
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"             # 共享内存上限，建议为显存的约20%
+
+---
+# vLLM HPA 自动扩缩容
+# 触发指标：等待队列长度 + KV cache使用率（均需Prometheus Adapter支持）
+# 指标注册名称由09_prometheus_adapter.yaml中的rules配置决定
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: vllm-hpa
+  namespace: inference-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vllm-server
+  minReplicas: 2                         # 最少2副本，保障跨AZ高可用
+  maxReplicas: 8
+
+  metrics:
+    # 指标1: 等待队列平均长度 > 20 时触发扩容
+    # 对应原始Prometheus指标: vllm:num_requests_waiting
+    - type: Pods
+      pods:
+        metric:
+          name: vllm_num_requests_waiting   # Prometheus Adapter注册名（冒号→下划线）
+        target:
+          type: AverageValue
+          averageValue: "20"
+
+    # 指标2: KV cache平均使用率 > 80% 时触发扩容
+    # 对应原始Prometheus指标: vllm:gpu_cache_usage_perc（值域0-100）
+    - type: Pods
+      pods:
+        metric:
+          name: vllm_gpu_cache_usage_perc  # Prometheus Adapter注册名
+        target:
+          type: AverageValue
+          averageValue: "80"
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60     # 扩容稳定窗口60秒：连续60秒超阈值才扩容，避免瞬时抖动
+      policies:
+        - type: Pods
+          value: 2                       # 每次最多扩容2个Pod
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300    # 缩容稳定窗口5分钟：防止流量回落后立刻缩容再反弹
+      policies:
+        - type: Pods
+          value: 1                       # 每次最多缩容1个Pod，保守策略减少服务波动
+          periodSeconds: 120

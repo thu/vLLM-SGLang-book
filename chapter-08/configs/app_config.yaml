@@ -1,0 +1,27 @@
+# configs/app_config.yaml
+# FastAPI 应用配置
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1          # SGLang 共享显存，多 worker 需额外配置
+
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  default_ttl: 1800   # 会话 TTL（秒），30 分钟
+
+dialogue:
+  max_context_tokens: 2048   # 上下文窗口 token 上限
+  window_size: 8             # 滑动窗口大小（轮次数）
+  enable_summarization: true # 超过 20 轮时启用 LLM 摘要压缩
+
+tools:
+  use_mock: true             # 开发阶段使用模拟数据；生产时改为 false
+  timeout_seconds: 10        # 工具调用超时（秒）
+  max_retries: 3             # 最大重试次数
+
+streaming:
+  buffer_size: 5             # 缓冲式流式输出的缓冲 token 数
+  default_max_tokens: 800    # 流式生成的默认最大 token 数

@@ -1,0 +1,153 @@
+# monitoring/grafana_panels.yaml
+# Grafana 监控面板配置
+#
+# 使用方式：
+#   1. 在 Grafana 中新建 Dashboard
+#   2. 以下 panels 的 targets.expr 字段可直接复制到
+#      Prometheus 数据源的 Query 框中
+#   3. thresholds 字段对应 Grafana 的阈值配置
+#
+# 前提：
+#   - Prometheus 已配置抓取 localhost:8000/metrics
+#   - SGLang /metrics 端点已配置为 Prometheus 抓取目标
+#   - vllm 原生指标（如有）已配置抓取
+
+panels:
+  - title: "缓存命中率（5 分钟滑动窗口）"
+    type: timeseries
+    description: >
+      token 级缓存命中率，理想稳态下 SGLang 应维持在 78% 以上，
+      vLLM 在 60% 以上。命中率持续低于 50% 时应检查前缀一致性。
+    targets:
+      - expr: |
+          rate(legal_cache_hit_tokens_total[5m])
+          /
+          (
+            rate(legal_cache_hit_tokens_total[5m])
+            + rate(legal_cache_miss_tokens_total[5m])
+          )
+        legendFormat: "{{framework}} 命中率"
+    thresholds:
+      - value: 0.78
+        color: green
+        label: "SGLang 目标线"
+      - value: 0.60
+        color: blue
+        label: "vLLM 目标线"
+      - value: 0.50
+        color: yellow
+        label: "告警线"
+      - value: 0.30
+        color: red
+        label: "严重告警"
+
+  - title: "TTFT 延迟 P50 / P95（秒）"
+    type: timeseries
+    description: >
+      按缓存状态分组的首 token 延迟。命中请求的 P95 TTFT 应
+      低于 2 秒；未命中请求的 P95 TTFT 约为 12–15 秒（正常）。
+      若命中请求的 P95 TTFT 持续超过 3 秒，可能存在缓存碎片化。
+    targets:
+      - expr: |
+          histogram_quantile(
+            0.50,
+            rate(legal_request_ttft_seconds_bucket[5m])
+          )
+        legendFormat: "{{framework}}-{{cache_status}} P50"
+      - expr: |
+          histogram_quantile(
+            0.95,
+            rate(legal_request_ttft_seconds_bucket[5m])
+          )
+        legendFormat: "{{framework}}-{{cache_status}} P95"
+
+  - title: "GPU 显存使用率（各卡）"
+    type: gauge
+    description: >
+      每张 GPU 卡的显存使用率。超过 90% 时应降低并发度；
+      超过 95% 时系统将进入 CRITICAL 降级状态，开始拒绝新请求。
+    targets:
+      - expr: |
+          gpu_memory_used_bytes / gpu_memory_total_bytes
+        legendFormat: "GPU-{{gpu}}"
+    thresholds:
+      - value: 0.75
+        color: green
+      - value: 0.90
+        color: yellow
+      - value: 0.95
+        color: red
+
+  - title: "活跃缓存文书数量"
+    type: timeseries
+    description: >
+      当前缓存中的文书数量估算值（基于 KV Cache 池使用量推算）。
+      稳定批处理期间应维持在 20–35 份之间（建议上限 30 份）；
+      出现剧烈波动时说明缓存淘汰频繁，可能需要降低并发度。
+    targets:
+      - expr: legal_active_cached_docs
+        legendFormat: "{{framework}} 缓存文书数"
+    thresholds:
+      - value: 30
+        color: yellow
+        label: "建议上限"
+      - value: 40
+        color: red
+        label: "容量告警"
+
+  - title: "请求吞吐量（req/s）"
+    type: timeseries
+    description: >
+      5 分钟滑动窗口内的请求完成速率。
+    targets:
+      - expr: |
+          rate(legal_request_e2e_seconds_count[5m])
+        legendFormat: "{{framework}} 吞吐量 (req/s)"
+
+  - title: "前缀层级命中分布"
+    type: piechart
+    description: >
+      按前缀层级（doc_body / instruction / system_prompt）
+      分类的命中 token 数占比。doc_body 层（L3）应占总命中的
+      90% 以上；若 system_prompt 层（L1）占比显著增大，
+      说明 L1 频繁未命中，需排查系统提示词一致性问题。
+    targets:
+      - expr: |
+          sum by (prefix_layer) (
+            legal_cache_hit_tokens_total{framework="sglang"}
+          )
+        legendFormat: "{{prefix_layer}}"
+
+alerting_rules:
+  - name: "CacheHitRatioLow"
+    expr: |
+      (
+        rate(legal_cache_hit_tokens_total[10m])
+        /
+        (
+          rate(legal_cache_hit_tokens_total[10m])
+          + rate(legal_cache_miss_tokens_total[10m])
+        )
+      ) < 0.50
+    for: "5m"
+    severity: "warning"
+    summary: "缓存命中率持续低于 50%，请检查前缀一致性配置"
+
+  - name: "GPUMemoryCritical"
+    expr: |
+      avg(gpu_memory_used_bytes / gpu_memory_total_bytes) > 0.93
+    for: "2m"
+    severity: "critical"
+    summary: "GPU 平均显存使用率超过 93%，存在 OOM 风险"
+
+  - name: "HighCacheMissTTFT"
+    expr: |
+      histogram_quantile(
+        0.95,
+        rate(legal_request_ttft_seconds_bucket{
+          cache_status="hit"
+        }[10m])
+      ) > 3.0
+    for: "5m"
+    severity: "warning"
+    summary: "缓存命中请求的 P95 TTFT 超过 3 秒，可能存在缓存碎片化"

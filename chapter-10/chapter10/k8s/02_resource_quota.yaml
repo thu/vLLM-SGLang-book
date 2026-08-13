@@ -1,0 +1,85 @@
+# 文件: chapter10/k8s/02_resource_quota.yaml
+#
+# 用途: 命名空间级资源配额、容器资源范围约束、工作负载优先级分级
+#
+# 应用顺序:
+#   kubectl create namespace inference-prod
+#   kubectl apply -f 02_resource_quota.yaml
+
+---
+# 命名空间级GPU配额：防止单一命名空间耗尽集群GPU资源
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ai-platform-gpu-quota
+  namespace: inference-prod
+spec:
+  hard:
+    requests.nvidia.com/gpu: "16"    # 命名空间内所有Pod合计最多申请16张GPU
+    limits.nvidia.com/gpu: "16"      # 上限与requests保持一致，避免超量分配
+    requests.memory: "2Ti"           # 内存配额上限：2 TiB
+    requests.cpu: "128"              # CPU配额上限：128核
+    pods: "50"                       # Pod总数上限，防止调度碎片化
+
+---
+# 容器资源范围约束：规范单Pod的GPU申请范围
+# 防止出现申请0张GPU或申请超过张量并行上限的异常配置
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: gpu-pod-limits
+  namespace: inference-prod
+spec:
+  limits:
+    - type: Container
+      # 未显式声明resources时的默认值
+      default:
+        nvidia.com/gpu: "1"
+        memory: "16Gi"
+        cpu: "8"
+      defaultRequest:
+        nvidia.com/gpu: "1"
+        memory: "16Gi"
+        cpu: "8"
+      # 单容器申请GPU数量的合法范围
+      max:
+        nvidia.com/gpu: "8"          # 上限：8张（对应tensor_parallel_size=8的场景）
+      min:
+        nvidia.com/gpu: "1"          # 下限：至少申请1张GPU
+
+---
+# 优先级分级：实时推理（最高）
+# 触发策略：PreemptLowerPriority —— 资源不足时驱逐低优先级Pod为自身腾出空间
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: realtime-inference
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "实时推理服务（vLLM/SGLang生产Pod），SLA敏感，可触发抢占驱逐低优先级Pod"
+
+---
+# 优先级分级：在线批处理（中等）
+# 可被实时服务抢占，但可以抢占离线批处理
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: online-batch
+value: 500000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "在线批处理服务，可容忍秒级延迟抖动，可被实时服务抢占"
+
+---
+# 优先级分级：离线批处理（最低）
+# 运行于Spot节点，随时可被高优先级任务驱逐
+# preemptionPolicy: Never —— 自身不触发抢占，只被动接受驱逐
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: offline-batch
+value: 100000
+globalDefault: true                  # 未指定priorityClassName的Pod默认使用此级别
+preemptionPolicy: Never
+description: "离线批处理，运行于Spot节点，支持检查点续跑，可随时被高优先级任务驱逐"

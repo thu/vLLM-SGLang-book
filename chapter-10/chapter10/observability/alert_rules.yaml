@@ -1,0 +1,177 @@
+# 文件: chapter10/observability/alert_rules.yaml
+#
+# Prometheus 告警规则：混合架构生产系统监控告警
+#
+# 应用方式（通过 Prometheus Operator）:
+#   kubectl apply -f alert_rules.yaml -n monitoring
+#
+# 告警分级:
+#   critical  —— 需要立即介入，影响用户服务（PagerDuty）
+#   warning   —— 需要关注，可能演变为严重问题（Slack）
+#   info      —— 记录运营事件，无需即时响应（日志）
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ai-platform-alerts
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    # ── 端点可用性告警 ──────────────────────────────────────────────────
+    - name: ai_platform.availability
+      interval: 30s
+      rules:
+        # vLLM 端点不可用（黑盒探针连续失败 > 2分钟）
+        - alert: VLLMEndpointDown
+          expr: |
+            avg_over_time(ai_platform_endpoint_up{framework="vllm"}[2m]) < 0.5
+          for: 2m
+          labels:
+            severity: critical
+            team: infra
+          annotations:
+            summary: "vLLM 推理端点不可用"
+            description: >
+              vLLM 端点 {{ $labels.endpoint }} 的黑盒探针在过去2分钟内成功率低于50%。
+              当前可用性: {{ $value | humanizePercentage }}。
+              请检查 Pod 状态: kubectl get pods -n inference-prod -l app=vllm-server
+
+        # SGLang 端点不可用
+        - alert: SGLangEndpointDown
+          expr: |
+            avg_over_time(ai_platform_endpoint_up{framework="sglang"}[2m]) < 0.5
+          for: 2m
+          labels:
+            severity: critical
+            team: infra
+          annotations:
+            summary: "SGLang 推理端点不可用"
+            description: >
+              SGLang 端点 {{ $labels.endpoint }} 在过去2分钟内可用性低于50%。
+              请检查 Pod 状态: kubectl get pods -n inference-prod -l app=sglang-server
+
+        # 双框架同时不可用（平台级故障）
+        - alert: BothFrameworksDown
+          expr: |
+            (avg_over_time(ai_platform_endpoint_up{framework="vllm"}[2m]) < 0.5)
+            and
+            (avg_over_time(ai_platform_endpoint_up{framework="sglang"}[2m]) < 0.5)
+          for: 1m
+          labels:
+            severity: critical
+            team: infra
+            escalate: "true"
+          annotations:
+            summary: "【P0】vLLM 和 SGLang 双框架同时不可用"
+            description: >
+              混合架构平台出现双框架同时故障，所有推理请求将失败。
+              立即启动应急预案，联系值班负责人。
+
+    # ── 延迟告警 ────────────────────────────────────────────────────────
+    - name: ai_platform.latency
+      interval: 60s
+      rules:
+        # vLLM P99 延迟过高（超过5秒，短文本推理场景）
+        - alert: VLLMHighLatencyP99
+          expr: |
+            histogram_quantile(0.99,
+              rate(ai_platform_e2e_latency_seconds_bucket{framework="vllm"}[5m])
+            ) > 5
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "vLLM P99 端到端延迟超过5秒"
+            description: >
+              vLLM 的探测 P99 延迟当前为 {{ $value | humanizeDuration }}，
+              超过5秒告警阈值，可能影响实时交互类业务的用户体验。
+              检查 KV cache 使用率和等待队列长度。
+
+        # SGLang P99 延迟过高（超过30秒，结构化生成场景阈值更宽松）
+        - alert: SGLangHighLatencyP99
+          expr: |
+            histogram_quantile(0.99,
+              rate(ai_platform_e2e_latency_seconds_bucket{framework="sglang"}[5m])
+            ) > 30
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "SGLang P99 端到端延迟超过30秒"
+            description: >
+              SGLang 的探测 P99 延迟为 {{ $value | humanizeDuration }}，
+              超过长上下文任务的30秒阈值。
+              检查 max-running-requests 配置和 RadixAttention 缓存状态。
+
+    # ── 框架内部指标告警 ────────────────────────────────────────────────
+    - name: ai_platform.framework_metrics
+      interval: 30s
+      rules:
+        # vLLM KV cache 接近耗尽（>90%，预示即将OOM或严重排队）
+        - alert: VLLMKVCacheNearExhaustion
+          expr: |
+            avg(vllm:gpu_cache_usage_perc) > 90
+          for: 3m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "vLLM KV Cache 使用率超过90%"
+            description: >
+              vLLM KV cache 平均使用率为 {{ $value | humanize }}%，
+              超过90%将导致新请求持续排队甚至OOM。
+              考虑触发水平扩容或检查是否有异常长序列占用缓存。
+
+        # vLLM 请求等待队列积压严重
+        - alert: VLLMRequestQueueHighBacklog
+          expr: |
+            avg(vllm:num_requests_waiting) > 50
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "vLLM 请求等待队列积压超过50"
+            description: >
+              vLLM 平均等待队列长度为 {{ $value | humanize }}，
+              超过50持续5分钟，HPA 应已触发扩容。
+              若 Pod 数已达上限（maxReplicas=8），需评估是否调整 HPA 上限。
+
+        # SGLang 请求队列积压
+        - alert: SGLangRequestQueueHighBacklog
+          expr: |
+            avg(sglang:num_queue_reqs) > 30
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "SGLang 请求队列积压超过30"
+            description: >
+              SGLang 平均队列积压为 {{ $value | humanize }}，
+              结构化生成任务排队严重。检查是否有超长上下文任务阻塞解码流水线。
+
+    # ── 降级状态告警 ────────────────────────────────────────────────────
+    - name: ai_platform.degradation
+      interval: 30s
+      rules:
+        # 探测错误率异常升高（可能预示框架内部问题）
+        - alert: ProbeErrorRateHigh
+          expr: |
+            rate(ai_platform_probe_errors_total[5m]) > 0.1
+          for: 2m
+          labels:
+            severity: warning
+            team: infra
+          annotations:
+            summary: "推理端点探测错误率超过0.1次/秒"
+            description: >
+              端点 {{ $labels.endpoint }} ({{ $labels.framework }}) 的
+              {{ $labels.error_type }} 类型错误率为 {{ $value | humanize }} 次/秒。
+              可能预示框架不稳定或网络链路问题。

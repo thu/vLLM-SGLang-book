@@ -1,0 +1,102 @@
+# 文件: chapter10/k8s/01_node_labels.yaml
+#
+# 用途: 为GPU节点打标签并设置Taint，将vLLM节点与SGLang节点隔离
+#       避免两类工作负载在同一节点上竞争显存
+#
+# 使用方式（手动打标签，节点名称替换为实际值）:
+#   kubectl label node <vllm-node-name> workload-type=vllm gpu-type=a100-80gb node-pool=production
+#   kubectl taint node <vllm-node-name> workload-type=vllm:NoSchedule
+#   kubectl label node <sglang-node-name> workload-type=sglang gpu-type=a100-80gb node-pool=production
+#   kubectl taint node <sglang-node-name> workload-type=sglang:NoSchedule
+#
+# 注意: 云托管集群（EKS/GKE/AKS）通常通过节点池配置而非直接编辑Node对象来设置标签，
+#       此处提供的是Node对象格式，供自建集群或节点池模板参考。
+
+---
+# vLLM专用节点配置示例
+apiVersion: v1
+kind: Node
+metadata:
+  name: gpu-node-a100-01          # 替换为实际节点名称
+  labels:
+    workload-type: vllm            # 用于Pod nodeSelector匹配
+    gpu-type: a100-80gb            # GPU规格标签，供资源申请参考
+    node-pool: production          # 节点池层级：production / staging / spot
+    topology.kubernetes.io/zone: us-east-1a   # 可用区标签（AZ感知调度使用）
+spec:
+  taints:
+    - key: "workload-type"
+      value: "vllm"
+      effect: NoSchedule           # 阻止未声明toleration的Pod调度至此节点
+
+---
+# vLLM节点 —— 第二个（不同可用区，保障AZ级高可用）
+apiVersion: v1
+kind: Node
+metadata:
+  name: gpu-node-a100-02
+  labels:
+    workload-type: vllm
+    gpu-type: a100-80gb
+    node-pool: production
+    topology.kubernetes.io/zone: us-east-1b
+spec:
+  taints:
+    - key: "workload-type"
+      value: "vllm"
+      effect: NoSchedule
+
+---
+# SGLang专用节点配置示例
+apiVersion: v1
+kind: Node
+metadata:
+  name: gpu-node-a100-03
+  labels:
+    workload-type: sglang          # 用于SGLang Pod的nodeSelector匹配
+    gpu-type: a100-80gb
+    node-pool: production
+    topology.kubernetes.io/zone: us-east-1a
+spec:
+  taints:
+    - key: "workload-type"
+      value: "sglang"
+      effect: NoSchedule
+
+---
+# SGLang节点 —— 第二个（不同可用区）
+apiVersion: v1
+kind: Node
+metadata:
+  name: gpu-node-a100-04
+  labels:
+    workload-type: sglang
+    gpu-type: a100-80gb
+    node-pool: production
+    topology.kubernetes.io/zone: us-east-1b
+spec:
+  taints:
+    - key: "workload-type"
+      value: "sglang"
+      effect: NoSchedule
+
+---
+# Spot批处理节点配置示例
+apiVersion: v1
+kind: Node
+metadata:
+  name: gpu-node-spot-01
+  labels:
+    workload-type: batch
+    gpu-type: a10g-24gb
+    node-pool: spot
+    spot: "true"                   # 用于批处理Job的nodeSelector匹配
+    topology.kubernetes.io/zone: us-east-1a
+spec:
+  taints:
+    - key: "workload-type"
+      value: "batch"
+      effect: NoSchedule
+    - key: "spot"
+      value: "true"
+      effect: NoSchedule           # 双重Taint确保只有声明两个toleration的Pod才能调度

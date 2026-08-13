@@ -1,0 +1,32 @@
+# ch06/requirements.txt
+# 第6章项目依赖
+# Python 3.11+
+#
+# 安装：pip install -r ch06/requirements.txt
+#
+# 注意：vLLM 的安装需要匹配 CUDA 版本，建议参考官方文档：
+#   https://docs.vllm.ai/en/v0.6.3/getting_started/installation.html
+
+# 推理引擎
+vllm==0.6.3
+
+# API 网关
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+httpx==0.27.2
+pydantic==2.9.2
+slowapi==0.1.9
+
+# 监控
+prometheus-client==0.21.0
+
+# 模型/分词器
+transformers==4.46.3
+huggingface_hub==0.26.2
+
+# 压测
+locust==2.32.2
+
+# 数据处理（脚本依赖）
+pandas==2.2.3
+numpy==2.1.3

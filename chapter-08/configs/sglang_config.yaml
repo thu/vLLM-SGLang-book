@@ -1,0 +1,21 @@
+# configs/sglang_config.yaml
+# SGLang Runtime 配置（对应 start_sglang_server.sh 的参数）
+# 测试环境: A100 80GB, ChatGLM-3-6B BF16, SGLang v0.1.17
+
+server:
+  host: "127.0.0.1"
+  port: 30000
+
+model:
+  path: "~/models/chatglm3-6b"
+  trust_remote_code: true    # ChatGLM-3 分词器含自定义代码，必须设置
+
+performance:
+  tp_size: 1                 # 张量并行度，单卡设为 1
+  mem_fraction_static: 0.85  # 显存预分配比例（0.9 默认值在高并发时可能 OOM）
+  context_length: 8192       # 上下文长度限制（ChatGLM-3 支持 32K，按需调整）
+  enable_flashinfer: true    # 启用 FlashInfer 加速注意力计算
+
+logging:
+  level: "info"
+  file: "logs/sglang_server.log"

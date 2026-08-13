@@ -1,0 +1,29 @@
+# requirements.txt
+# Chapter 7 依赖清单
+# 安装：pip install -r requirements.txt
+#
+# 注意：torch 需要根据 CUDA 版本单独安装，见下方说明。
+# CUDA 12.1：pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu121
+# CUDA 12.4：pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu124
+
+# ── 推理引擎 ──
+sglang[all]~=0.4.0
+
+# ── 数据验证 ──
+pydantic[email]~=2.5
+
+# ── 文档解析 ──
+pymupdf~=1.24
+python-docx~=1.1
+
+# ── 异步 HTTP 客户端 ──
+aiohttp~=3.9
+aiofiles~=23.2
+
+# ── 日志与进度 ──
+loguru~=0.7
+tqdm~=4.66
+
+# ── HuggingFace 模型下载 ──
+huggingface-hub~=0.23
+transformers~=4.41    # 用于 tokenizer 验证，不用于推理

@@ -1,0 +1,185 @@
+# 文件: chapter10/k8s/06_sglang_deployment.yaml
+#
+# 用途: SGLang推理服务的Deployment、HPA自动扩缩容配置
+#
+# 与vLLM部署的关键差异:
+#   1. 启动命令: python -m sglang.launch_server（非vllm.entrypoints）
+#   2. 默认端口: 30000
+#   3. --mem-fraction-static: 控制RadixAttention静态KV cache池比例，
+#      建议0.85——为动态分配保留15%余量，既保障缓存命中率又防止峰值OOM
+#   4. HPA扩容判断优先依据请求队列积压，不依据缓存使用率：
+#      新副本无缓存历史，扩容后缓存命中率会被稀释，
+#      因此只有在队列积压明确时才值得扩容
+#
+# 应用方式:
+#   kubectl apply -f 06_sglang_deployment.yaml -n inference-prod
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-server
+  namespace: inference-prod
+  labels:
+    app: sglang-server
+    version: v0.5.0
+    framework: sglang
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sglang-server
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: sglang-server
+        framework: sglang
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "30000"
+        prometheus.io/path: "/metrics"    # SGLang v0.5.x 通过--enable-metrics开启此端点
+    spec:
+      priorityClassName: realtime-inference
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: sglang-server
+
+      nodeSelector:
+        workload-type: sglang
+
+      tolerations:
+        - key: "workload-type"
+          operator: "Equal"
+          value: "sglang"
+          effect: "NoSchedule"
+
+      containers:
+        - name: sglang-server
+          image: lmsysorg/sglang:v0.5.0-cu121
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -m
+            - sglang.launch_server
+          args:
+            - --model-path=/models/Qwen2.5-7B-Instruct
+            - --served-model-name=qwen2.5-7b-sglang
+            - --port=30000
+            - --host=0.0.0.0
+            - --mem-fraction-static=0.85    # 静态KV cache池：占总显存85%
+                                             # RadixAttention的缓存命中率与此值正相关
+                                             # 低于0.80会使高复用率场景的吞吐量显著下降
+            - --max-running-requests=128    # 同时运行（decode阶段）的最大请求数
+            - --max-total-tokens=131072     # RadixAttention前缀树的总token容量
+                                             # 该值越大，可缓存的前缀组合越多
+            - --chunked-prefill-size=8192   # 分块预填充单片大小（tokens），控制prefill粒度
+            - --enable-metrics              # 开启Prometheus指标端点（/metrics）
+            - --decode-log-interval=50      # 每50个decode步骤记录一次日志
+
+          ports:
+            - containerPort: 30000
+              name: http
+              protocol: TCP
+
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "32Gi"
+              cpu: "8"
+            limits:
+              nvidia.com/gpu: "1"
+              memory: "32Gi"
+              cpu: "8"
+
+          # SGLang初始化包含RadixAttention缓存预热，耗时通常比vLLM长10-30秒
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 30000
+            initialDelaySeconds: 150
+            periodSeconds: 10
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 30000
+            initialDelaySeconds: 200
+            periodSeconds: 30
+            failureThreshold: 5
+
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+              readOnly: true
+            - name: shared-memory
+              mountPath: /dev/shm
+
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: model-storage-pvc
+        - name: shared-memory
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"
+
+---
+# SGLang HPA 自动扩缩容
+#
+# 设计原则: 只依据请求队列积压判断是否扩容。
+#   SGLang的核心优势是RadixAttention前缀缓存复用。
+#   新副本启动后没有缓存历史，扩容会稀释全局缓存命中率。
+#   因此缩容稳定窗口（600秒）远长于vLLM（300秒），
+#   给每个副本足够的时间积累缓存，再由HPA判断是否真正需要缩减。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sglang-hpa
+  namespace: inference-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sglang-server
+  minReplicas: 2
+  maxReplicas: 6                         # SGLang上限低于vLLM：单副本因缓存复用承载能力更强
+
+  metrics:
+    # 请求队列积压 > 15 时触发扩容
+    # 对应原始Prometheus指标: sglang:num_queue_reqs（SGLang v0.5.x 暴露名称）
+    - type: Pods
+      pods:
+        metric:
+          name: sglang_num_queue_reqs    # Prometheus Adapter注册名（冒号→下划线）
+        target:
+          type: AverageValue
+          averageValue: "15"
+
+  behavior:
+    scaleUp:
+      # 扩容稳定窗口90秒（长于vLLM的60秒）：
+      # SGLang启动耗时更长，过于激进的扩容反而因频繁冷启动降低整体缓存命中率
+      stabilizationWindowSeconds: 90
+      policies:
+        - type: Pods
+          value: 1                       # 每次只扩容1个Pod，保守策略保护缓存积累
+          periodSeconds: 90
+    scaleDown:
+      # 缩容稳定窗口600秒（10分钟）：给每个副本充足时间积累Radix前缀缓存
+      # 避免缓存刚热身就被缩容，导致下次请求高峰时缓存命中率断崖式下降
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 180

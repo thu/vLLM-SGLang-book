@@ -1,0 +1,37 @@
+# ch06/monitoring/prometheus.yml
+# Prometheus 2.55 采集配置
+#
+# 采集目标：
+#   - vLLM 推理服务（原生 /metrics 端点）
+#   - FastAPI 网关（自定义 /metrics 端点）
+#   - Node Exporter（主机硬件指标，GPU 利用率从此获取）
+
+global:
+  scrape_interval: 10s       # 10 秒采集一次，平衡时效性与存储压力
+  evaluation_interval: 10s
+  scrape_timeout: 8s
+
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  # vLLM 推理服务
+  - job_name: vllm
+    static_configs:
+      - targets:
+          - localhost:8000
+    metrics_path: /metrics
+
+  # FastAPI 网关（多实例）
+  - job_name: gateway
+    static_configs:
+      - targets:
+          - localhost:8001
+          - localhost:8002
+
+  # DCGM Exporter（NVIDIA GPU 指标）
+  # 需要先启动：docker run --gpus all -p 9400:9400 nvcr.io/nvidia/k8s/dcgm-exporter
+  - job_name: dcgm
+    static_configs:
+      - targets:
+          - localhost:9400

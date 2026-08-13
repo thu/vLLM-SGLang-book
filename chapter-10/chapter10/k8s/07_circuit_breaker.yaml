@@ -1,0 +1,76 @@
+# 文件: chapter10/k8s/07_circuit_breaker.yaml
+#
+# 用途: 为vLLM和SGLang配置Istio熔断规则（OutlierDetection）
+#
+# 熔断机制说明:
+#   Envoy的OutlierDetection以Pod为粒度进行健康状态跟踪。
+#   当某个Pod连续返回5xx错误或连接超时超过阈值时，
+#   Envoy将该Pod从负载均衡池中临时驱逐（ejection），
+#   经过baseEjectionTime后重新纳入健康检查。
+#
+#   关键参数:
+#     maxEjectionPercent: 50     —— 最多驱逐50%的Pod，保留基本服务能力
+#     minHealthyPercent: 30      —— 健康Pod低于30%时停止驱逐，防止级联全量熔断
+#
+# 应用方式:
+#   kubectl apply -f 07_circuit_breaker.yaml -n inference-prod
+
+---
+# vLLM服务熔断规则
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: vllm-circuit-breaker
+  namespace: inference-prod
+spec:
+  host: vllm-service
+  trafficPolicy:
+    # 连接池限制：防止单个Pod被过多并发连接压垮
+    connectionPool:
+      tcp:
+        maxConnections: 1000             # 最大TCP连接数
+        connectTimeout: 5s
+      http:
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 100    # 单连接最大请求数，超出后强制重建连接
+        maxRetries: 3
+        h2UpgradePolicy: UPGRADE        # 优先使用HTTP/2，降低连接建立开销
+
+    # 异常点检测（熔断核心配置）
+    outlierDetection:
+      consecutive5xxErrors: 5            # 连续5次5xx错误触发Pod驱逐
+      interval: 30s                      # 检测窗口：每30秒统计一次错误率
+      baseEjectionTime: 60s             # 首次驱逐持续60秒，后续驱逐时间倍增
+      maxEjectionPercent: 50            # 最多同时驱逐50%的Pod（保留最低服务能力）
+      minHealthyPercent: 30             # 健康Pod低于30%时停止驱逐（防止全量熔断）
+      splitExternalLocalOriginErrors: false
+
+---
+# SGLang服务熔断规则
+# 与vLLM基本相同，区别在于SGLang处理长上下文任务耗时更长，
+# 连接超时阈值相应放宽
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: sglang-circuit-breaker
+  namespace: inference-prod
+spec:
+  host: sglang-service
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 500              # SGLang并发连接数上限低于vLLM（任务类型决定）
+        connectTimeout: 10s             # 连接超时放宽至10秒（应对长上下文任务的慢启动）
+      http:
+        http2MaxRequests: 500
+        maxRequestsPerConnection: 50
+        maxRetries: 2                    # 结构化生成任务重试次数减少，避免重复消耗算力
+        h2UpgradePolicy: UPGRADE
+
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 60s
+      maxEjectionPercent: 50
+      minHealthyPercent: 30
+      splitExternalLocalOriginErrors: false

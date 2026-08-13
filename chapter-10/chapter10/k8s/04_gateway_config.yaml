@@ -1,0 +1,131 @@
+# 文件: chapter10/k8s/04_gateway_config.yaml
+#
+# 用途: 定义Istio入口网关和基础路由规则
+#
+# 路由逻辑（优先级从高到低）:
+#   1. /sglang/* 前缀 → SGLang集群（结构化生成、长上下文）
+#   2. /v1/* 前缀    → vLLM集群（通用API，默认路由）
+#
+# 注意: 生产环境应将 TLS 证书 ai-platform-tls 提前通过 cert-manager 或
+#       手动方式写入 istio-system 命名空间的 Secret，否则 Gateway 无法启动 HTTPS 监听。
+#
+# 应用方式:
+#   kubectl apply -f 04_gateway_config.yaml -n inference-prod
+
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: ai-platform-gateway
+  namespace: inference-prod
+spec:
+  selector:
+    istio: ingressgateway            # 匹配03_istio_install.sh安装的ingress gateway
+  servers:
+    - port:
+        number: 443
+        name: https
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: ai-platform-tls   # TLS证书存放在istio-system命名空间的同名Secret中
+      hosts:
+        - "api.ai-platform.internal"
+    # 开发/测试环境可额外保留HTTP监听（生产环境删除此段）
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "api.ai-platform.internal"
+
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: ai-platform-routing
+  namespace: inference-prod
+spec:
+  hosts:
+    - "api.ai-platform.internal"
+  gateways:
+    - ai-platform-gateway
+  http:
+    # ── 规则1: SGLang专属路径 ──────────────────────────────────────────────
+    # /sglang/* 显式声明为SGLang端点，供需要直接控制目标框架的调用方使用
+    - name: sglang-explicit-path
+      match:
+        - uri:
+            prefix: "/sglang/"
+      rewrite:
+        uri: "/"                     # 剥离路径前缀，转发给SGLang的根路径
+      route:
+        - destination:
+            host: sglang-service
+            port:
+              number: 30000
+      timeout: 300s                  # 长上下文任务允许较长超时（5分钟）
+      retries:
+        attempts: 2
+        perTryTimeout: 150s
+        retryOn: "5xx,reset,connect-failure"
+
+    # ── 规则2: vLLM默认路径 ───────────────────────────────────────────────
+    # /v1/* 是OpenAI兼容接口的标准路径前缀，默认由vLLM承接
+    # 10.4.1节的负载均衡控制器会动态调整此规则的weight分配
+    - name: vllm-default-path
+      match:
+        - uri:
+            prefix: "/v1/"
+      route:
+        - destination:
+            host: vllm-service
+            port:
+              number: 8000
+          weight: 100                # 初始权重100%路由至vLLM；过载时控制器会调整
+        - destination:
+            host: sglang-service
+            port:
+              number: 30000
+          weight: 0                  # 初始溢出权重为0；过载时控制器将其调高
+      timeout: 60s
+      retries:
+        attempts: 3
+        perTryTimeout: 20s
+        retryOn: "5xx,reset,connect-failure"
+
+---
+# vLLM Service（供VirtualService引用）
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+  namespace: inference-prod
+  labels:
+    app: vllm-server
+spec:
+  selector:
+    app: vllm-server
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+
+---
+# SGLang Service（供VirtualService引用）
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-service
+  namespace: inference-prod
+  labels:
+    app: sglang-server
+spec:
+  selector:
+    app: sglang-server
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+      protocol: TCP
