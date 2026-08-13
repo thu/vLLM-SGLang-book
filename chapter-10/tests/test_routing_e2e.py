@@ -20,7 +20,7 @@ import sys
 import os
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../chapter10"))
 
 from router.classifier import classify, RouteTarget, SYSTEM_PROMPT_TOKEN_THRESHOLD
 

@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../chapter10"))
 
 
 # ── 降级核心逻辑测试（Mock Redis）────────────────────────────────────────
